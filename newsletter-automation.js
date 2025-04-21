@@ -1,32 +1,99 @@
 // newsletter-automation.js
-// Complete system to generate and send a weekly development newsletter using AI
+// Sistema completo para generar y enviar un newsletter semanal de desarrollo usando IA
 
-// Import dependencies
+// Importar dependencias
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const nodemailer = require('nodemailer');
 const dotenv = require('dotenv');
 const { marked } = require('marked');
 const cron = require('node-cron');
 
-// Load environment variables
+// Importar Headers de node-fetch para compatibilidad con Resend
+const nodeFetch = require('node-fetch');
+global.fetch = nodeFetch;
+global.Headers = nodeFetch.Headers;
+global.Request = nodeFetch.Request;
+global.Response = nodeFetch.Response;
+
+const { Resend } = require('resend');
+
+// Cargar variables de entorno
 dotenv.config();
 
-// APIs and services configuration
+// Configuración de APIs y servicios
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const EMAIL_USER = process.env.EMAIL_USER;
-const EMAIL_PASSWORD = process.env.EMAIL_PASSWORD;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const FROM_EMAIL = process.env.FROM_EMAIL || 'onboarding@resend.dev'; // Dirección de correo corregida
 const SUBSCRIBERS_FILE = path.join(__dirname, 'subscribers.json');
 
-// Check if subscribers file exists, if not, create it
+// Verificar si existe el archivo de suscriptores, si no, crearlo
 if (!fs.existsSync(SUBSCRIBERS_FILE)) {
   fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify({ subscribers: [] }));
 }
 
-// Function to generate content with AI (Claude API)
+// Inicializar cliente de Resend
+const resend = new Resend(RESEND_API_KEY);
+
+// Función para enviar email con Resend con manejo mejorado de errores
+async function sendEmail(to, subject, html) {
+  try {
+    const data = await resend.emails.send({
+      from: FROM_EMAIL,
+      to: to,
+      subject: subject,
+      html: html
+    });
+    
+    return data;
+  } catch (error) {
+    console.error('Error enviando email con Resend:');
+    
+    // Mejorar el registro de errores para facilitar la depuración
+    if (error.response) {
+      console.error('Código de estado:', error.response.status);
+      
+      // Intentar mostrar el cuerpo de la respuesta de forma segura
+      if (error.response.data) {
+        if (typeof error.response.data === 'string') {
+          console.error('Respuesta (primeros 200 caracteres):', error.response.data.substring(0, 200));
+        } else {
+          console.error('Datos de respuesta:', JSON.stringify(error.response.data));
+        }
+      }
+    } else {
+      console.error(error.message || error);
+    }
+    
+    throw error;
+  }
+}
+
+// Función para implementar reintentos en el envío de emails
+async function sendEmailWithRetry(to, subject, html, maxRetries = 3) {
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      return await sendEmail(to, subject, html);
+    } catch (error) {
+      retries++;
+      console.log(`Intento ${retries}/${maxRetries} fallido. Reintentando en ${Math.pow(2, retries)} segundos...`);
+      
+      if (retries >= maxRetries) {
+        console.error(`Máximo de reintentos (${maxRetries}) alcanzado. Email no enviado a ${to}`);
+        throw error;
+      }
+      
+      // Esperar un tiempo antes de reintentar (backoff exponencial)
+      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, retries)));
+    }
+  }
+}
+
+// Función para generar contenido con IA (Claude API)
 async function generateContent() {
-  console.log('Generating content with AI...');
+  console.log('Generando contenido con IA...');
   
   try {
     const response = await axios.post(
@@ -37,18 +104,19 @@ async function generateContent() {
         messages: [
           {
             role: 'user',
-            content: `Generate a weekly software development newsletter for the current date.
-              Include the following sections:
-              1. Creative title related to software development
-              2. Brief introduction (one paragraph)
-              3. "Weekly Trends": Include 3-4 current trends in software development
-              4. "Main Article": A short article (300-400 words) about an emerging technology or practice
-              5. "Code Tips": 2-3 useful snippets with explanation
-              6. "Tools to Discover": 2-3 tools or resources with links and brief description
-              7. A short final reflection
+            content: `Genera un newsletter semanal sobre desarrollo de software para la fecha actual.
+              Incluye las siguientes secciones:
+              1. Título creativo relacionado con desarrollo de software
+              2. Introducción breve (un párrafo)
+              3. "Tendencias de la semana": Incluye 3-4 tendencias actuales en desarrollo de software
+              4. "Artículo principal": Un artículo breve (300-400 palabras) sobre una tecnología o práctica emergente
+              5. "Consejos de código": 2-3 snippets útiles con explicación
+              6. "Herramientas para conocer": 2-3 herramientas o recursos con enlaces y breve descripción
+              7. Una reflexión final corta
 
-              The format should be in Markdown to facilitate HTML conversion.
-              Make sure it's current, technically accurate, and useful for developers of all levels.`
+              El formato debe ser en Markdown para facilitar la conversión a HTML.
+              Asegúrate que sea actual, técnicamente preciso y útil para desarrolladores de todos los niveles.
+              Debe estar completamente en español.`
           }
         ]
       },
@@ -63,42 +131,42 @@ async function generateContent() {
 
     return response.data.content[0].text;
   } catch (error) {
-    console.error('Error generating content:', error.message);
+    console.error('Error generando contenido:', error.message);
     if (error.response) {
-      console.error('Details:', error.response.data);
+      console.error('Detalles:', error.response.data);
     }
-    return '## Error generating content\n\nWe apologize, an error occurred while generating this week\'s content.';
+    return '## Error al generar contenido\n\nLo sentimos, ha ocurrido un error al generar el contenido de esta semana.';
   }
 }
 
-// Function to generate tech news headlines
+// Función para generar titulares de noticias tecnológicas actuales
 async function fetchTechNews() {
   try {
-    console.log('Fetching tech news...');
-    // You can replace this API with one of your choice
-    const response = await axios.get(`https://newsapi.org/v2/top-headlines?category=technology&language=en&apiKey=${process.env.NEWS_API_KEY}`);
+    console.log('Obteniendo noticias tecnológicas...');
+    // Puedes reemplazar esta API con la que prefieras
+    const response = await axios.get(`https://newsapi.org/v2/top-headlines?category=technology&language=es&apiKey=${process.env.NEWS_API_KEY}`);
     
-    let newsContent = '## Technology News\n\n';
-    const articles = response.data.articles.slice(0, 3); // Only the first 3 news
+    let newsContent = '## Noticias de Tecnología\n\n';
+    const articles = response.data.articles.slice(0, 3); // Solo las primeras 3 noticias
     
     articles.forEach(article => {
       newsContent += `### [${article.title}](${article.url})\n`;
-      newsContent += `${article.description || 'No description available'}\n\n`;
+      newsContent += `${article.description || 'Sin descripción disponible'}\n\n`;
     });
     
     return newsContent;
   } catch (error) {
-    console.error('Error fetching news:', error.message);
-    return '## Technology News\n\nNo news available this week.';
+    console.error('Error obteniendo noticias:', error.message);
+    return '## Noticias de Tecnología\n\nNo hay noticias disponibles esta semana.';
   }
 }
 
-// Function to convert Markdown to HTML
+// Función para convertir Markdown a HTML
 function convertToHtml(markdown) {
   return marked(markdown);
 }
 
-// Function to create an HTML email template
+// Función para crear una plantilla de email HTML
 function createEmailTemplate(content) {
   return `
     <!DOCTYPE html>
@@ -106,30 +174,44 @@ function createEmailTemplate(content) {
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Development Newsletter</title>
+      <title>v Pills - Píldoras de Conocimiento</title>
       <style>
         body {
           font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
           line-height: 1.6;
-          color: #333;
+          color: #333333;
           max-width: 700px;
           margin: 0 auto;
           padding: 20px;
+          background-color: #f9f9f9;
         }
         .header {
-          background-color: #4285f4;
+          background-color: #003A70; /* Azul Vector */
           color: white;
           padding: 20px;
           text-align: center;
           border-radius: 5px 5px 0 0;
         }
+        .header h1 {
+          margin: 0;
+          font-size: 32px;
+        }
+        .header h1 span {
+          color: #FFCC00; /* Acento dorado */
+        }
         .content {
           padding: 20px;
-          background-color: #f9f9f9;
-          border: 1px solid #ddd;
+          background-color: #FFFFFF;
+          border: 1px solid #E0E0E0;
+          border-top: none;
         }
-        h1, h2, h3 {
-          color: #4285f4;
+        h2 {
+          color: #003A70; /* Azul Vector */
+          border-bottom: 2px solid #FFCC00;
+          padding-bottom: 5px;
+        }
+        h3 {
+          color: #E31937; /* Rojo Vector */
         }
         code {
           background-color: #f0f0f0;
@@ -150,27 +232,46 @@ function createEmailTemplate(content) {
           text-align: center;
           padding: 20px;
           font-size: 0.8em;
-          color: #666;
+          color: #666666;
+          background-color: #003A70;
+          color: white;
+          border-radius: 0 0 5px 5px;
         }
         a {
-          color: #4285f4;
+          color: #E31937; /* Rojo Vector */
           text-decoration: none;
+          font-weight: bold;
+        }
+        .footer a {
+          color: #FFCC00; /* Acento dorado para enlaces en footer */
+        }
+        .tip-box {
+          background-color: #F0F7FF;
+          border-left: 4px solid #003A70;
+          padding: 15px;
+          margin: 20px 0;
+        }
+        .news-item {
+          padding: 15px;
+          margin-bottom: 15px;
+          background-color: #F5F5F5;
+          border-radius: 5px;
         }
       </style>
     </head>
     <body>
       <div class="header">
-        <h1>💻 Weekly Development Newsletter</h1>
-        <p>Latest trends, tools and tips for developers</p>
+        <h1><span>v</span> Pills</h1>
+        <p>Píldoras de conocimiento para desarrolladores</p>
       </div>
       <div class="content">
         ${content}
       </div>
       <div class="footer">
-        <p>© ${new Date().getFullYear()} Development Newsletter. All rights reserved.</p>
+        <p>© ${new Date().getFullYear()} v Pills - Vector Casa de Bolsa. Todos los derechos reservados.</p>
         <p>
-          <a href="[unsubscribe_link]">Unsubscribe</a> | 
-          <a href="[web_version]">View in browser</a>
+          <a href="[unsubscribe_link]">Cancelar suscripción</a> | 
+          <a href="[web_version]">Ver en navegador</a>
         </p>
       </div>
     </body>
@@ -178,81 +279,62 @@ function createEmailTemplate(content) {
   `;
 }
 
-// Configure email transport
-function setupMailTransporter() {
-  return nodemailer.createTransport({
-    service: 'gmail', // You can change to another service if you prefer
-    auth: {
-      user: EMAIL_USER,
-      pass: EMAIL_PASSWORD
-    }
-  });
-}
-
-// Get subscribers list
+// Obtener lista de suscriptores
 function getSubscribers() {
   const data = fs.readFileSync(SUBSCRIBERS_FILE);
   return JSON.parse(data).subscribers;
 }
 
-// Send newsletter to all subscribers
+// Enviar newsletter a todos los suscriptores
 async function sendNewsletter() {
-  console.log('Starting newsletter delivery...');
+  console.log('Iniciando envío de newsletter...');
   
   try {
-    // Generate content
+    // Generar contenido
     const mainContent = await generateContent();
     const newsContent = await fetchTechNews();
     const fullContent = newsContent + '\n\n' + mainContent;
     
-    // Convert to HTML
+    // Convertir a HTML
     const htmlContent = convertToHtml(fullContent);
     const emailHtml = createEmailTemplate(htmlContent);
     
-    // Configure email transporter
-    const transporter = setupMailTransporter();
-    
-    // Get subscribers
+    // Obtener suscriptores
     const subscribers = getSubscribers();
     
     if (subscribers.length === 0) {
-      console.log('No subscribers to send the newsletter to.');
+      console.log('No hay suscriptores para enviar el newsletter.');
       return;
     }
     
-    // Save a copy of the newsletter
+    // Guardar copia del newsletter
     const date = new Date().toISOString().split('T')[0];
-    fs.writeFileSync(`newsletter-${date}.html`, emailHtml);
-    fs.writeFileSync(`newsletter-${date}.md`, fullContent);
+    fs.writeFileSync(`generated/newsletter-${date}.html`, emailHtml);
+    fs.writeFileSync(`generated/newsletter-${date}.md`, fullContent);
     
-    // Send emails
-    console.log(`Sending newsletter to ${subscribers.length} subscribers...`);
+    // Enviar emails
+    console.log(`Enviando newsletter a ${subscribers.length} suscriptores...`);
     
-    // Email information
-    const mailOptions = {
-      from: `"Development Newsletter" <${EMAIL_USER}>`,
-      subject: `📱💻 Development Newsletter - ${new Date().toLocaleDateString()}`,
-      html: emailHtml
-    };
+    // Información del email
+    const subject = `📱💻 v Pills - Píldoras de Conocimiento - ${new Date().toLocaleDateString()}`;
     
-    // Send to each subscriber
+    // Enviar a cada suscriptor con reintentos
     for (const email of subscribers) {
       try {
-        mailOptions.to = email;
-        await transporter.sendMail(mailOptions);
-        console.log(`Newsletter sent to: ${email}`);
+        await sendEmailWithRetry(email, subject, emailHtml);
+        console.log(`Newsletter enviado a: ${email}`);
       } catch (error) {
-        console.error(`Error sending to ${email}:`, error.message);
+        console.error(`Error final enviando a ${email}:`, error.message);
       }
     }
     
-    console.log('Newsletter delivery process completed.');
+    console.log('Proceso de envío de newsletter completado.');
   } catch (error) {
-    console.error('Error in newsletter process:', error);
+    console.error('Error en el proceso de newsletter:', error);
   }
 }
 
-// Simple API to manage subscriptions
+// API simple para gestionar suscripciones
 const express = require('express');
 const bodyParser = require('body-parser');
 const app = express();
@@ -261,29 +343,56 @@ const PORT = process.env.PORT || 3000;
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Main page - subscription form
+// Página principal - formulario de suscripción
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
       <meta charset="utf-8">
-      <title>Subscribe to our Development Newsletter</title>
+      <title>Suscríbete a v Pills</title>
       <style>
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
-        .form-container { background-color: #f9f9f9; border: 1px solid #ddd; padding: 20px; border-radius: 5px; }
-        input, button { padding: 10px; margin: 10px 0; width: 100%; box-sizing: border-box; }
-        button { background-color: #4285f4; color: white; border: none; cursor: pointer; }
-        h1 { color: #4285f4; }
+        body { 
+          font-family: 'Segoe UI', Tahoma, sans-serif; 
+          max-width: 600px; 
+          margin: 0 auto; 
+          padding: 20px; 
+          background-color: #f5f5f5;
+        }
+        .form-container { 
+          background-color: #fff; 
+          border: 1px solid #ddd; 
+          padding: 20px; 
+          border-radius: 5px; 
+          box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        input, button { 
+          padding: 10px; 
+          margin: 10px 0; 
+          width: 100%; 
+          box-sizing: border-box; 
+        }
+        button { 
+          background-color: #003A70; 
+          color: white; 
+          border: none; 
+          cursor: pointer; 
+        }
+        h1 { 
+          color: #003A70; 
+        }
+        h1 span {
+          color: #E31937;
+        }
       </style>
     </head>
     <body>
-      <h1>Development Newsletter</h1>
+      <h1><span>v</span> Pills</h1>
       <div class="form-container">
-        <h2>Subscribe to receive weekly news about software development</h2>
+        <h2>Suscríbete para recibir píldoras semanales de conocimiento sobre desarrollo de software</h2>
         <form action="/subscribe" method="post">
-          <input type="email" name="email" placeholder="Your email address" required>
-          <button type="submit">Subscribe</button>
+          <input type="email" name="email" placeholder="Tu correo electrónico" required>
+          <button type="submit">Suscribirme</button>
         </form>
       </div>
     </body>
@@ -291,12 +400,12 @@ app.get('/', (req, res) => {
   `);
 });
 
-// Endpoint to subscribe
+// Endpoint para suscribirse
 app.post('/subscribe', (req, res) => {
   const { email } = req.body;
   
   if (!email) {
-    return res.status(400).send('Email is required');
+    return res.status(400).send('El correo electrónico es requerido');
   }
   
   try {
@@ -305,7 +414,7 @@ app.post('/subscribe', (req, res) => {
     if (!data.subscribers.includes(email)) {
       data.subscribers.push(email);
       fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(data, null, 2));
-      console.log(`New subscriber: ${email}`);
+      console.log(`Nuevo suscriptor: ${email}`);
     }
     
     res.send(`
@@ -313,53 +422,98 @@ app.post('/subscribe', (req, res) => {
       <html>
       <head>
         <meta charset="utf-8">
-        <title>Subscription Successful!</title>
+        <title>¡Suscripción Exitosa!</title>
         <style>
-          body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; text-align: center; }
-          .success { background-color: #d6f5d6; border: 1px solid #a3e0a3; padding: 20px; border-radius: 5px; }
-          h1 { color: #4285f4; }
+          body { 
+            font-family: 'Segoe UI', Tahoma, sans-serif; 
+            max-width: 600px; 
+            margin: 0 auto; 
+            padding: 20px; 
+            text-align: center;
+            background-color: #f5f5f5;
+          }
+          .success { 
+            background-color: #fff; 
+            border-left: 4px solid #00A651; 
+            padding: 20px; 
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+          }
+          h1 { 
+            color: #003A70; 
+          }
+          h1 span {
+            color: #E31937;
+          }
         </style>
       </head>
       <body>
-        <h1>Development Newsletter</h1>
+        <h1><span>v</span> Pills</h1>
         <div class="success">
-          <h2>Thank you for subscribing!</h2>
-          <p>Your email ${email} has been registered successfully.</p>
-          <p>You'll receive our weekly newsletter with the latest news on software development.</p>
-          <a href="/">Back to home</a>
+          <h2>¡Gracias por suscribirte!</h2>
+          <p>Tu correo ${email} ha sido registrado correctamente.</p>
+          <p>Recibirás nuestras píldoras semanales con las últimas novedades sobre desarrollo de software.</p>
+          <a href="/">Volver al inicio</a>
         </div>
       </body>
       </html>
     `);
   } catch (error) {
-    console.error('Error subscribing:', error);
-    res.status(500).send('Error processing subscription');
+    console.error('Error al suscribir:', error);
+    res.status(500).send('Error al procesar la suscripción');
   }
 });
 
-// Endpoint to unsubscribe
+// Endpoint para cancelar suscripción
 app.get('/unsubscribe', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
       <meta charset="utf-8">
-      <title>Cancel Subscription</title>
+      <title>Cancelar Suscripción</title>
       <style>
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
-        .form-container { background-color: #f9f9f9; border: 1px solid #ddd; padding: 20px; border-radius: 5px; }
-        input, button { padding: 10px; margin: 10px 0; width: 100%; box-sizing: border-box; }
-        button { background-color: #f44336; color: white; border: none; cursor: pointer; }
-        h1 { color: #4285f4; }
+        body { 
+          font-family: 'Segoe UI', Tahoma, sans-serif; 
+          max-width: 600px; 
+          margin: 0 auto; 
+          padding: 20px;
+          background-color: #f5f5f5;
+        }
+        .form-container { 
+          background-color: #fff; 
+          border: 1px solid #ddd; 
+          padding: 20px; 
+          border-radius: 5px;
+          box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        input, button { 
+          padding: 10px; 
+          margin: 10px 0; 
+          width: 100%; 
+          box-sizing: border-box; 
+        }
+        button { 
+          background-color: #E31937; 
+          color: white; 
+          border: none; 
+          cursor: pointer; 
+        }
+        h1 { 
+          color: #003A70; 
+        }
+        h1 span {
+          color: #E31937;
+        }
       </style>
     </head>
     <body>
-      <h1>Cancel Subscription</h1>
+      <h1><span>v</span> Pills</h1>
       <div class="form-container">
-        <h2>Do you want to stop receiving our newsletter?</h2>
+        <h2>¿Deseas dejar de recibir nuestras píldoras de conocimiento?</h2>
         <form action="/unsubscribe" method="post">
-          <input type="email" name="email" placeholder="Your email address" required>
-          <button type="submit">Unsubscribe</button>
+          <input type="email" name="email" placeholder="Tu correo electrónico" required>
+          <button type="submit">Cancelar Suscripción</button>
         </form>
       </div>
     </body>
@@ -371,7 +525,7 @@ app.post('/unsubscribe', (req, res) => {
   const { email } = req.body;
   
   if (!email) {
-    return res.status(400).send('Email is required');
+    return res.status(400).send('El correo electrónico es requerido');
   }
   
   try {
@@ -380,7 +534,7 @@ app.post('/unsubscribe', (req, res) => {
     if (data.subscribers.includes(email)) {
       data.subscribers = data.subscribers.filter(e => e !== email);
       fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(data, null, 2));
-      console.log(`Subscriber removed: ${email}`);
+      console.log(`Suscriptor eliminado: ${email}`);
     }
     
     res.send(`
@@ -388,63 +542,89 @@ app.post('/unsubscribe', (req, res) => {
       <html>
       <head>
         <meta charset="utf-8">
-        <title>Subscription Cancelled</title>
+        <title>Suscripción Cancelada</title>
         <style>
-          body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; text-align: center; }
-          .success { background-color: #ffe6e6; border: 1px solid #ffb3b3; padding: 20px; border-radius: 5px; }
-          h1 { color: #4285f4; }
+          body { 
+            font-family: 'Segoe UI', Tahoma, sans-serif; 
+            max-width: 600px; 
+            margin: 0 auto; 
+            padding: 20px; 
+            text-align: center;
+            background-color: #f5f5f5;
+          }
+          .success { 
+            background-color: #fff; 
+            border-left: 4px solid #E31937; 
+            padding: 20px; 
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+          }
+          h1 { 
+            color: #003A70; 
+          }
+          h1 span {
+            color: #E31937;
+          }
         </style>
       </head>
       <body>
-        <h1>Development Newsletter</h1>
+        <h1><span>v</span> Pills</h1>
         <div class="success">
-          <h2>Subscription Cancelled</h2>
-          <p>Your email ${email} has been removed from our list.</p>
-          <p>You will no longer receive newsletters.</p>
-          <p>If you change your mind, you can subscribe again at any time.</p>
-          <a href="/">Back to home</a>
+          <h2>Suscripción Cancelada</h2>
+          <p>Tu correo ${email} ha sido eliminado de nuestra lista.</p>
+          <p>Ya no recibirás más newsletters.</p>
+          <p>Si cambias de opinión, puedes volver a suscribirte en cualquier momento.</p>
+          <a href="/">Volver al inicio</a>
         </div>
       </body>
       </html>
     `);
   } catch (error) {
-    console.error('Error cancelling subscription:', error);
-    res.status(500).send('Error processing cancellation');
+    console.error('Error al cancelar suscripción:', error);
+    res.status(500).send('Error al procesar la cancelación');
   }
 });
 
-// Endpoint to send newsletter manually (protected)
+// Endpoint para enviar el newsletter manualmente (protegido)
 app.post('/send-newsletter', (req, res) => {
   const { adminKey } = req.body;
   
   if (adminKey !== process.env.ADMIN_KEY) {
-    return res.status(401).send('Unauthorized');
+    return res.status(401).send('No autorizado');
   }
   
-  // Send newsletter
+  // Enviar newsletter
   sendNewsletter()
     .then(() => {
-      res.send('Newsletter sent successfully');
+      res.send('Newsletter enviado correctamente');
     })
     .catch((error) => {
       console.error('Error:', error);
-      res.status(500).send('Error sending newsletter');
+      res.status(500).send('Error al enviar el newsletter');
     });
 });
 
-// Schedule automatic delivery (every Monday at 9:00 AM)
+// Programar envío automático (todos los lunes a las 9:00 AM)
 cron.schedule('0 9 * * 1', () => {
-  console.log('Executing scheduled newsletter delivery...');
+  console.log('Ejecutando envío programado del newsletter...');
   sendNewsletter();
 });
 
-// Start server
+// Iniciar servidor
 app.listen(PORT, () => {
-  console.log(`Server started at http://localhost:${PORT}`);
-  console.log('Newsletter will be sent automatically every Monday at 9:00 AM');
+  console.log(`Servidor iniciado en http://localhost:${PORT}`);
+  console.log('El newsletter se enviará automáticamente todos los lunes a las 9:00 AM');
 });
 
-// Export functions for use in other modules if needed
+// Para probar el envío inmediatamente al iniciar (opcional, comentar en producción)
+// setTimeout(() => {
+//   console.log('Ejecutando envío de prueba...');
+//   sendNewsletter().then(() => {
+//     console.log('Envío de prueba completado');
+//   });
+// }, 3000);
+
+// Exportar funciones para uso en otros módulos si es necesario
 module.exports = {
   generateContent,
   sendNewsletter
