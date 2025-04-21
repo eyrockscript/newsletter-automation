@@ -306,6 +306,12 @@ async function sendNewsletter() {
       console.log('No hay suscriptores para enviar el newsletter.');
       return;
     }
+
+    // Asegurar que existe el directorio para guardar los newsletters generados
+    const GENERATED_DIR = path.join(__dirname, 'generated');
+    if (!fs.existsSync(GENERATED_DIR)) {
+      fs.mkdirSync(GENERATED_DIR);
+    }
     
     // Guardar copia del newsletter
     const date = new Date().toISOString().split('T')[0];
